@@ -1,61 +1,28 @@
-from flask import Flask, render_template, request
-import joblib
-import pandas as pd
+import streamlit as st
+from model import predict_emergency_congestion
 
-app = Flask(__name__)
+st.set_page_config(page_title="응급실 혼잡도 예측", layout="centered")
+st.title("🏥 응급실 혼잡도 예측 시스템")
 
-# 모델 및 전처리 도구 로드
-rf = joblib.load('random_forest_model.pkl')
-scaler = joblib.load('scaler_ml.pkl')
-le_type = joblib.load('le_medical_type.pkl')
-le_scale = joblib.load('le_bed_scale.pkl')
+with st.form("input_form"):
+    col1, col2 = st.columns(2)
+    with col1:
+        bed = st.number_input("병상수", min_value=1.0, step=1.0)
+        room = st.number_input("입원실수", min_value=1.0, step=1.0)
+        doctor = st.number_input("의료인수", min_value=1.0, step=1.0)
+    with col2:
+        cluster = st.selectbox("군집 번호", [0, 1, 2], format_func=lambda x: {0:"중소형",1:"중대형",2:"초대형"}[x])
+        med_type = st.selectbox("의료기관종별명", ["종합병원", "병원"])
+    
+    submitted = st.form_submit_button("혼잡도 예측")
 
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    # 폼에서 입력 받기
-    bed = float(request.form['bed'])
-    room = float(request.form['room'])
-    doctor = float(request.form['doctor'])
-    cluster = int(request.form['cluster'])
-    med_type = request.form['med_type']
+if submitted:
+    with st.spinner("예측 중..."):
+        pred, prob = predict_emergency_congestion(bed, room, doctor, cluster, med_type)
     
-    # 파생 변수 계산
-    occupancy = room / bed
-    doctor_per_room = room / doctor
-    is_general = 1 if med_type == '종합병원' else 0
-    # 병상 규모
-    if bed <= 100:
-        bed_scale = '소형'
-    elif bed <= 300:
-        bed_scale = '중형'
-    else:
-        bed_scale = '대형'
+    st.success(f"### 예측 결과: **{pred}**")
     
-    # 인코딩
-    med_enc = le_type.transform([med_type])[0]
-    scale_enc = le_scale.transform([bed_scale])[0]
-    
-    # 특징 배열 생성 (순서 중요!)
-    X = pd.DataFrame([[
-        bed, room, doctor, cluster,
-        doctor/bed, occupancy, doctor_per_room,
-        is_general, scale_enc
-    ]], columns=[
-        '병상수', '입원실수', '의료인수', 'cluster',
-        '의료인_병상_비율', '입원실_점유율', '의료인_당_입원실',
-        '종합병원_여부', '병상_규모_encoded'
-    ])
-    
-    X_scaled = scaler.transform(X)
-    pred = rf.predict(X_scaled)[0]
-    prob = rf.predict_proba(X_scaled)[0]
-    prob_dict = dict(zip(rf.classes_, prob))
-    
-    return render_template('result.html', pred=pred, prob=prob_dict)
-
-if __name__ == '__main__':
-    app.run(debug=True)
+    # 확률을 게이지 형태로 표시
+    st.subheader("클래스별 확률")
+    for label, p in prob.items():
+        st.progress(p, text=f"{label}: {p:.2%}")
