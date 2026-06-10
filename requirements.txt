@@ -1,9 +1,10 @@
 pandas
 numpy
 scikit-learn
-folium
 joblib
 matplotlib
 seaborn
 koreanize-matplotlib
 flask
+folium
+streamlit-folium
