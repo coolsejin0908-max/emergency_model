@@ -1,21 +1,15 @@
+# API 서버가 실행 중일 때 (예: localhost:8000)
 import requests
 
-API = "http://localhost:8000"
-
-er = {
-    "er_id": "ER99",
-    "name": "테스트병원",
-    "current_patients": 15,
-    "available_beds": 2,
-    "severity_level": 3
+url = "http://localhost:8000/predict"
+data = {
+    "bed": 150,
+    "room": 45,
+    "doctor": 80,
+    "cluster": 0,
+    "med_type": "종합병원"
 }
-resp = requests.post(f"{API}/predict", json=er)
-print("예측 결과:", resp.json())
 
-req = {
-    "user_location": "서울시 종로구",
-    "severity_level": 2,
-    "er_list": None
-}
-resp2 = requests.post(f"{API}/recommend", json=req)
-print("추천 결과:", resp2.json()["best_er"])
+response = requests.post(url, json=data)
+print(response.status_code)
+print(response.json())
