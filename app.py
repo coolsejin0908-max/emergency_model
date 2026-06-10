@@ -1,3 +1,10 @@
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+
+# 시스템에 설치된 나눔폰트를 matplotlib에 등록
+mpl.font_manager.fontManager.addfont('/usr/share/fonts/truetype/nanum/NanumGothic.ttf')
+plt.rc('font', family='NanumGothic')
+plt.rcParams['axes.unicode_minus'] = False
 # app.py
 import streamlit as st
 import pandas as pd
