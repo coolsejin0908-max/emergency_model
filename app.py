@@ -1,28 +1,47 @@
 import streamlit as st
-from model import predict_emergency_congestion
+import folium
+from streamlit_folium import st_folium
+import pandas as pd
+import joblib
 
-st.set_page_config(page_title="응급실 혼잡도 예측", layout="centered")
-st.title("🏥 응급실 혼잡도 예측 시스템")
+# 페이지 설정
+st.set_page_config(page_title="응급실 혼잡도 지도", layout="wide")
 
-with st.form("input_form"):
-    col1, col2 = st.columns(2)
-    with col1:
-        bed = st.number_input("병상수", min_value=1.0, step=1.0)
-        room = st.number_input("입원실수", min_value=1.0, step=1.0)
-        doctor = st.number_input("의료인수", min_value=1.0, step=1.0)
-    with col2:
-        cluster = st.selectbox("군집 번호", [0, 1, 2], format_func=lambda x: {0:"중소형",1:"중대형",2:"초대형"}[x])
-        med_type = st.selectbox("의료기관종별명", ["종합병원", "병원"])
-    
-    submitted = st.form_submit_button("혼잡도 예측")
+# 1. CSV 파일 로드 (혼잡도 컬럼이 미리 계산되어 있다고 가정)
+#    만약 없다면, 여기서 df_new를 읽고 모델로 혼잡도를 계산한 후 저장하는 로직 필요
+df = pd.read_csv("emergency_hospitals.csv")  # 미리 준비된 파일
 
-if submitted:
-    with st.spinner("예측 중..."):
-        pred, prob = predict_emergency_congestion(bed, room, doctor, cluster, med_type)
+# 2. 지도 생성
+m = folium.Map(location=[37.5665, 126.9780], zoom_start=11)
+
+# WMS 레이어 추가
+folium.WmsTileLayer(
+    url="https://safemap.go.kr/openapi2/IF_0047_WMS",
+    name="응급의료시설 (WMS)",
+    fmt="image/png",
+    layers="0",
+    transparent=True,
+    overlay=True,
+    control=True
+).add_to(m)
+
+# 3. CSV 데이터로 마커 추가
+for _, row in df.iterrows():
+    # 혼잡도에 따른 색상
+    congestion = row.get('혼잡도', '정보 없음')
+    if congestion == '혼잡':
+        color = 'red'
+    elif congestion == '보통':
+        color = 'orange'
+    else:
+        color = 'green'
     
-    st.success(f"### 예측 결과: **{pred}**")
-    
-    # 확률을 게이지 형태로 표시
-    st.subheader("클래스별 확률")
-    for label, p in prob.items():
-        st.progress(p, text=f"{label}: {p:.2%}")
+    folium.Marker(
+        location=[row['좌표정보(Y)'], row['좌표정보(X)']],  # 위도, 경도 순서
+        popup=f"{row['사업장명']}<br>혼잡도: {congestion}<br>병상수: {row['병상수']}",
+        icon=folium.Icon(color=color, icon='plus', prefix='fa')
+    ).add_to(m)
+
+# 4. Streamlit에 표시
+st.title("🚑 응급실 혼잡도 현황")
+st_folium(m, width=1000, height=600)
