@@ -8,3 +8,4 @@ koreanize-matplotlib
 flask
 folium
 streamlit-folium
+streamlit-geolocation
