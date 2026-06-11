@@ -1,11 +1,10 @@
+streamlit
 pandas
 numpy
 scikit-learn
 joblib
-matplotlib
-seaborn
-koreanize-matplotlib
-flask
 folium
 streamlit-folium
 streamlit-geolocation
+matplotlib
+requests
