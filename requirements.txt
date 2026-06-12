@@ -8,3 +8,4 @@ streamlit-folium
 streamlit-geolocation
 matplotlib
 requests
+utm
