@@ -250,3 +250,36 @@ with col2:
 
 st.markdown("---")
 st.caption("🔥 히트맵: 빨간색일수록 혼잡, 초록색일수록 여유. WMS 레이어는 국립중앙의료원 제공.")
+import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+
+st.set_page_config(layout="wide")
+st.title("🗺️ 응급실 위치 테스트")
+
+# CSV 로드
+df = pd.read_csv("emergency_hospitals.csv")
+
+# 디버그 정보 출력
+st.write(f"✅ 로드된 병원 수: {len(df)}")
+st.write("📌 좌표 샘플 (처음 5개):")
+st.write(df[['사업장명', '좌표정보(X)', '좌표정보(Y)']].head())
+
+# 좌표 NaN 제거
+df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+st.write(f"🗺️ 유효한 좌표를 가진 병원 수: {len(df)}")
+
+# 지도 생성 (서울 중심)
+m = folium.Map(location=[37.5665, 126.9780], zoom_start=11)
+
+# 마커 추가
+for _, row in df.iterrows():
+    folium.Marker(
+        location=[row['좌표정보(Y)'], row['좌표정보(X)']],
+        popup=row['사업장명'],
+        icon=folium.Icon(color='red', icon='plus', prefix='fa')
+    ).add_to(m)
+
+# 지도 표시
+st_folium(m, width=900, height=600)
