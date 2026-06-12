@@ -1,4 +1,4 @@
-# app.py - 최종 버전 (히트맵 포함)
+# app.py - 최종 통합 버전 (히트맵 + 디버그 포함)
 import streamlit as st
 import pandas as pd
 import joblib
@@ -41,8 +41,20 @@ def load_model():
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
-    # 좌표 NaN 제거
-    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    
+    # ===== 디버그 정보 출력 =====
+    st.write("### 🔍 디버그: CSV 로드 결과")
+    st.write(f"전체 행 수: {len(df)}")
+    st.write(f"컬럼 목록: {list(df.columns)}")
+    if '좌표정보(X)' in df.columns and '좌표정보(Y)' in df.columns:
+        st.write(f"'좌표정보(X)' NaN 개수: {df['좌표정보(X)'].isna().sum()}")
+        st.write(f"'좌표정보(Y)' NaN 개수: {df['좌표정보(Y)'].isna().sum()}")
+        st.write("샘플 데이터 (첫 5행):")
+        st.write(df[['사업장명', '좌표정보(X)', '좌표정보(Y)']].head())
+        df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+        st.write(f"NaN 제거 후 행 수: {len(df)}")
+    else:
+        st.error("❌ '좌표정보(X)' 또는 '좌표정보(Y)' 컬럼이 없습니다!")
     return df
 
 # 실시간 가용 병상 정보 조회 (5분 캐시)
@@ -187,7 +199,6 @@ with col1:
         control=True
     ).add_to(m)
     
-    # ========== 🔥 히트맵 추가 ==========
     # 주변 병원 필터링
     df_map = df_hosp.copy()
     if user_lat and user_lon:
@@ -198,16 +209,14 @@ with col1:
     else:
         st.info(f"🗺️ 전체 {len(df_map)}개의 응급실")
     
-    # 히트맵 데이터 준비
+    # ========== 히트맵 추가 ==========
     heat_data = []
     weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
-    
     for _, row in df_map.iterrows():
         lat = row['좌표정보(Y)']
         lon = row['좌표정보(X)']
         weight = weight_map.get(row['혼잡도'], 0)
         heat_data.append([lat, lon, weight])
-    
     HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
     # ========== 히트맵 끝 ==========
     
