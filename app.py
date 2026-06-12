@@ -283,3 +283,45 @@ for _, row in df.iterrows():
 
 # 지도 표시
 st_folium(m, width=900, height=600)
+import streamlit as st
+import pandas as pd
+import folium
+from streamlit_folium import st_folium
+
+st.set_page_config(layout="wide")
+st.title("응급실 위치 테스트")
+
+# CSV 로드
+try:
+    df = pd.read_csv("emergency_hospitals.csv")
+    st.write(f"로드된 행 수: {len(df)}")
+except Exception as e:
+    st.error(f"CSV 파일을 읽을 수 없습니다: {e}")
+    st.stop()
+
+# 좌표 컬럼 확인
+if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
+    st.error("CSV에 '좌표정보(X)' 또는 '좌표정보(Y)' 컬럼이 없습니다.")
+    st.write("실제 컬럼:", list(df.columns))
+    st.stop()
+
+# NaN 제거
+df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+st.write(f"유효한 좌표를 가진 행 수: {len(df)}")
+
+if len(df) == 0:
+    st.error("좌표 값이 모두 NaN입니다. CSV 파일을 확인하세요.")
+    st.stop()
+
+# 지도 생성 (서울 중심)
+m = folium.Map(location=[37.5665, 126.9780], zoom_start=11)
+
+# 마커 추가
+for _, row in df.iterrows():
+    folium.Marker(
+        location=[row['좌표정보(Y)'], row['좌표정보(X)']],
+        popup=row.get('사업장명', '이름 없음'),
+        icon=folium.Icon(color='red')
+    ).add_to(m)
+
+st_folium(m, width=900, height=600)
