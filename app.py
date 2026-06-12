@@ -5,6 +5,8 @@ import joblib
 import folium
 from streamlit_folium import st_folium
 from streamlit_geolocation import streamlit_geolocation
+import requests
+import xml.etree.ElementTree as ET
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from math import radians, sin, cos, sqrt, atan2
@@ -19,7 +21,14 @@ plt.rcParams['axes.unicode_minus'] = False
 
 st.set_page_config(page_title="응급실 혼잡도 예측", layout="wide")
 
-# ---------- 캐시 로드 ----------
+# ---------- Secrets에서 API 키 가져오기 ----------
+try:
+    SERVICE_KEY = st.secrets["API_KEY"]
+except:
+    st.error("❌ API_KEY가 secrets.toml에 설정되지 않았습니다.")
+    st.stop()
+
+# ---------- 캐시 데이터 로드 ----------
 @st.cache_resource
 def load_model():
     rf = joblib.load("random_forest_model.pkl")
@@ -31,27 +40,60 @@ def load_model():
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
-    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    # 디버그 정보 (앱 실행 시 한 번만 표시, 이후 캐시됨)
+    st.write("### 🧪 디버그 정보 (관리자용)")
+    st.write(f"CSV 행 수: {len(df)}")
+    st.write(f"컬럼 목록: {list(df.columns)}")
+    st.write(f"좌표 X NaN 개수: {df['좌표정보(X)'].isna().sum() if '좌표정보(X)' in df.columns else '컬럼 없음'}")
+    st.write(f"좌표 Y NaN 개수: {df['좌표정보(Y)'].isna().sum() if '좌표정보(Y)' in df.columns else '컬럼 없음'}")
+    if '좌표정보(X)' in df.columns and '좌표정보(Y)' in df.columns:
+        st.write("샘플 데이터 (첫 3행):")
+        st.write(df[['사업장명', '좌표정보(X)', '좌표정보(Y)']].head(3))
+        df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    else:
+        st.error("❌ CSV에 '좌표정보(X)' 또는 '좌표정보(Y)' 컬럼이 없습니다.")
     return df
 
-try:
-    rf, scaler, le_type, le_scale = load_model()
-    df_all = load_hospital_data()
-except Exception as e:
-    st.error(f"필수 파일을 불러오지 못했습니다: {e}")
-    st.stop()
+# 실시간 가용 병상 정보 조회 (5분 캐시)
+@st.cache_data(ttl=300)
+def get_realtime_beds(stage1="서울특별시", stage2=""):
+    url = "http://apis.data.go.kr/B552657/ErmctInfoInqireService/getEmrrmRltmUsefulSckbdInfoInqire"
+    params = {
+        "ServiceKey": SERVICE_KEY,
+        "STAGE1": stage1,
+        "STAGE2": stage2,
+        "pageNo": "1",
+        "numOfRows": "500"
+    }
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            root = ET.fromstring(response.content)
+            result_code = root.findtext(".//resultCode")
+            if result_code == "00":
+                items = root.findall(".//item")
+                bed_dict = {}
+                for item in items:
+                    hpid = item.findtext("hpid")
+                    hvec = item.findtext("hvec")
+                    if hpid and hvec and hvec.isdigit():
+                        bed_dict[hpid] = int(hvec)
+                return bed_dict
+    except Exception as e:
+        st.error(f"실시간 데이터 로드 실패: {e}")
+    return {}
 
-# ---------- 거리 계산 함수 (Haversine) ----------
+# 거리 계산 (Haversine)
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371  # km
+    R = 6371
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
-# ---------- 예측 함수 ----------
-def predict_congestion(bed, room, doctor, cluster, med_type):
+# 혼잡도 예측 함수
+def predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type, le_scale):
     occupancy = room / bed
     doctor_per_room = room / doctor
     is_general = 1 if med_type == "종합병원" else 0
@@ -78,31 +120,30 @@ def predict_congestion(bed, room, doctor, cluster, med_type):
     prob = rf.predict_proba(input_scaled)[0]
     return pred, dict(zip(rf.classes_, prob))
 
-# ---------- 사이드바 설정 ----------
+# ---------- 메인 ----------
+rf, scaler, le_type, le_scale = load_model()
+df_hosp = load_hospital_data()
+
+# 사이드바 입력
 st.sidebar.title("🏥 응급실 혼잡도 예측")
 mode = st.sidebar.radio("입력 방식", ["간편 모드 (질문)", "전문가 모드 (슬라이더)"])
 
 if mode == "간편 모드 (질문)":
-    st.sidebar.subheader("병원 규모")
     size = st.sidebar.selectbox("병원 규모", ["작은 병원 (30병상 미만)", "중간 병원 (30~100병상)", "큰 병원 (100병상 이상)"])
-    st.sidebar.subheader("응급실 의사 수")
     doc_level = st.sidebar.selectbox("의사 수", ["1~2명", "3~5명", "6명 이상"])
-    
     if size == "작은 병원 (30병상 미만)":
         bed = 20
     elif size == "중간 병원 (30~100병상)":
         bed = 60
     else:
         bed = 200
-    
     if doc_level == "1~2명":
         doctor = 2
     elif doc_level == "3~5명":
         doctor = 4
     else:
         doctor = 8
-    
-    room = bed * 0.3  # 입원실수는 병상수의 30%로 가정
+    room = bed * 0.3
     cluster = 0 if bed < 100 else (1 if bed < 300 else 2)
     med_type = "종합병원" if bed > 100 else "병원"
     st.sidebar.info(f"↳ 병상수 약 {bed}개, 의료인수 약 {doctor}명으로 예측합니다.")
@@ -115,7 +156,7 @@ else:
 
 predict_btn = st.sidebar.button("🚀 혼잡도 예측", type="primary")
 
-# ---------- 위치 정보 가져오기 ----------
+# 위치 정보
 st.sidebar.markdown("---")
 st.sidebar.subheader("📍 내 주변 병원 찾기")
 location = streamlit_geolocation()
@@ -124,23 +165,23 @@ if location and 'latitude' in location:
     user_lat, user_lon = location['latitude'], location['longitude']
     st.sidebar.success("위치 정보를 가져왔습니다.")
 else:
-    st.sidebar.info("버튼을 눌러 현재 위치를 공유해보세요.")
+    st.sidebar.info("버튼을 눌러 현재 위치를 공유하세요.")
 
-# ---------- 메인 화면 ----------
+# 메인 화면
 st.title("📊 응급실 혼잡도 예측 대시보드")
 
 col1, col2 = st.columns([3,1])
 
 with col1:
     st.subheader("🗺️ 응급의료시설 현황 지도")
-    # 지도 중심 설정
     if user_lat and user_lon:
         map_center = [user_lat, user_lon]
-        zoom_start = 12
+        zoom_start = 13
     else:
         map_center = [37.5665, 126.9780]
         zoom_start = 11
     m = folium.Map(location=map_center, zoom_start=zoom_start)
+    
     # WMS 레이어
     folium.WmsTileLayer(
         url="https://safemap.go.kr/openapi2/IF_0047_WMS",
@@ -151,6 +192,7 @@ with col1:
         overlay=True,
         control=True
     ).add_to(m)
+    
     # 사용자 위치 마커
     if user_lat and user_lon:
         folium.Marker(
@@ -158,23 +200,51 @@ with col1:
             popup="현재 위치",
             icon=folium.Icon(color="red", icon="home", prefix="fa")
         ).add_to(m)
-    # 병원 마커 (주변 10km 이내만 표시)
-    df_map = df_all.copy()
+    
+    # 실시간 데이터 가져오기 (API 연동 부분)
+    realtime_beds = get_realtime_beds()
+    
+    # 주변 병원 필터링
+    df_map = df_hosp.copy()
     if user_lat and user_lon:
         df_map['distance'] = df_map.apply(
             lambda row: haversine(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), axis=1)
-        df_map = df_map[df_map['distance'] <= 10]  # 10km 이내
-        st.info(f"현 위치 반경 10km 내 {len(df_map)}개의 응급실이 있습니다.")
+        df_map = df_map[df_map['distance'] <= 10]
+        st.info(f"📍 반경 10km 내 {len(df_map)}개의 응급실")
+    else:
+        st.info(f"🗺️ 전체 {len(df_map)}개의 응급실 (위치 공유 시 주변 병원만 표시)")
+    
+    # 마커 추가 (중요!)
     for _, row in df_map.iterrows():
-        color_map = {"혼잡":"red","보통":"orange","여유":"green"}
-        color = color_map.get(row["혼잡도"], "gray")
-        popup_text = f"<b>{row['사업장명']}</b><br>혼잡도: {row['혼잡도']}<br>병상수: {row['병상수']}<br>입원실수: {row['입원실수']}<br>의료인수: {row['의료인수']}"
+        # 실시간 병상 정보 (hpid가 없으면 매칭 안 됨)
+        hpid = row.get('hpid', None)
+        real_beds = realtime_beds.get(hpid, "정보 없음") if hpid else "정보 없음"
+        
+        # 마커 색상 결정 (가용 병상 기준)
+        if isinstance(real_beds, int):
+            if real_beds <= 5:
+                color = "red"
+            elif real_beds <= 15:
+                color = "orange"
+            else:
+                color = "green"
+        else:
+            color = "gray"
+        
+        # 팝업 내용
+        popup_html = f"<b>{row['사업장명']}</b><br>"
+        popup_html += f"🚑 실시간 가용 응급실 병상: {real_beds}<br>"
+        popup_html += f"📊 예측 혼잡도: {row['혼잡도']}<br>"
+        popup_html += f"🛏️ 총 병상수: {row['병상수']}<br>"
+        popup_html += f"👨‍⚕️ 의료인수: {row['의료인수']}"
+        
         folium.Marker(
-            location=[row["좌표정보(Y)"], row["좌표정보(X)"]],
-            popup=popup_text,
+            location=[row['좌표정보(Y)'], row['좌표정보(X)']],
+            popup=popup_html,
             icon=folium.Icon(color=color, icon="plus", prefix="fa"),
-            tooltip=row["사업장명"]
+            tooltip=row['사업장명']
         ).add_to(m)
+    
     folium.LayerControl().add_to(m)
     st_folium(m, width=900, height=600)
 
@@ -182,7 +252,7 @@ with col2:
     st.subheader("📋 예측 결과")
     if predict_btn:
         with st.spinner("예측 중..."):
-            pred, prob = predict_congestion(bed, room, doctor, cluster, med_type)
+            pred, prob = predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type, le_scale)
         if pred == "혼잡":
             st.error(f"### 🔴 예측 혼잡도: **{pred}**")
         elif pred == "보통":
@@ -196,4 +266,4 @@ with col2:
         st.info("👈 왼쪽 사이드바에서 정보를 입력하고 예측 버튼을 눌러주세요.")
 
 st.markdown("---")
-st.caption("※ 지도 마커 색상: 빨강(혼잡), 주황(보통), 초록(여유). WMS 레이어는 국립중앙의료원에서 제공합니다.")
+st.caption("※ 마커 색상: 빨강(가용병상 ≤5), 주황(6~15), 초록(≥16). WMS 레이어는 국립중앙의료원 제공.")
