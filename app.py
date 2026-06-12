@@ -1,4 +1,4 @@
-# app.py
+# app.py - 최종 버전 (히트맵 포함)
 import streamlit as st
 import pandas as pd
 import joblib
@@ -10,6 +10,7 @@ import xml.etree.ElementTree as ET
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 from math import radians, sin, cos, sqrt, atan2
+from folium.plugins import HeatMap
 
 # ---------- 한글 폰트 설정 ----------
 try:
@@ -40,18 +41,8 @@ def load_model():
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
-    # 디버그 정보 (앱 실행 시 한 번만 표시, 이후 캐시됨)
-    st.write("### 🧪 디버그 정보 (관리자용)")
-    st.write(f"CSV 행 수: {len(df)}")
-    st.write(f"컬럼 목록: {list(df.columns)}")
-    st.write(f"좌표 X NaN 개수: {df['좌표정보(X)'].isna().sum() if '좌표정보(X)' in df.columns else '컬럼 없음'}")
-    st.write(f"좌표 Y NaN 개수: {df['좌표정보(Y)'].isna().sum() if '좌표정보(Y)' in df.columns else '컬럼 없음'}")
-    if '좌표정보(X)' in df.columns and '좌표정보(Y)' in df.columns:
-        st.write("샘플 데이터 (첫 3행):")
-        st.write(df[['사업장명', '좌표정보(X)', '좌표정보(Y)']].head(3))
-        df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
-    else:
-        st.error("❌ CSV에 '좌표정보(X)' 또는 '좌표정보(Y)' 컬럼이 없습니다.")
+    # 좌표 NaN 제거
+    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
     return df
 
 # 실시간 가용 병상 정보 조회 (5분 캐시)
@@ -173,13 +164,16 @@ st.title("📊 응급실 혼잡도 예측 대시보드")
 col1, col2 = st.columns([3,1])
 
 with col1:
-    st.subheader("🗺️ 응급의료시설 현황 지도")
+    st.subheader("🗺️ 응급의료시설 현황 지도 (히트맵)")
+    
+    # 지도 중심 설정
     if user_lat and user_lon:
         map_center = [user_lat, user_lon]
         zoom_start = 13
     else:
         map_center = [37.5665, 126.9780]
         zoom_start = 11
+    
     m = folium.Map(location=map_center, zoom_start=zoom_start)
     
     # WMS 레이어
@@ -193,17 +187,7 @@ with col1:
         control=True
     ).add_to(m)
     
-    # 사용자 위치 마커
-    if user_lat and user_lon:
-        folium.Marker(
-            location=[user_lat, user_lon],
-            popup="현재 위치",
-            icon=folium.Icon(color="red", icon="home", prefix="fa")
-        ).add_to(m)
-    
-    # 실시간 데이터 가져오기 (API 연동 부분)
-    realtime_beds = get_realtime_beds()
-    
+    # ========== 🔥 히트맵 추가 ==========
     # 주변 병원 필터링
     df_map = df_hosp.copy()
     if user_lat and user_lon:
@@ -212,37 +196,27 @@ with col1:
         df_map = df_map[df_map['distance'] <= 10]
         st.info(f"📍 반경 10km 내 {len(df_map)}개의 응급실")
     else:
-        st.info(f"🗺️ 전체 {len(df_map)}개의 응급실 (위치 공유 시 주변 병원만 표시)")
+        st.info(f"🗺️ 전체 {len(df_map)}개의 응급실")
     
-    # 마커 추가 (중요!)
+    # 히트맵 데이터 준비
+    heat_data = []
+    weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
+    
     for _, row in df_map.iterrows():
-        # 실시간 병상 정보 (hpid가 없으면 매칭 안 됨)
-        hpid = row.get('hpid', None)
-        real_beds = realtime_beds.get(hpid, "정보 없음") if hpid else "정보 없음"
-        
-        # 마커 색상 결정 (가용 병상 기준)
-        if isinstance(real_beds, int):
-            if real_beds <= 5:
-                color = "red"
-            elif real_beds <= 15:
-                color = "orange"
-            else:
-                color = "green"
-        else:
-            color = "gray"
-        
-        # 팝업 내용
-        popup_html = f"<b>{row['사업장명']}</b><br>"
-        popup_html += f"🚑 실시간 가용 응급실 병상: {real_beds}<br>"
-        popup_html += f"📊 예측 혼잡도: {row['혼잡도']}<br>"
-        popup_html += f"🛏️ 총 병상수: {row['병상수']}<br>"
-        popup_html += f"👨‍⚕️ 의료인수: {row['의료인수']}"
-        
+        lat = row['좌표정보(Y)']
+        lon = row['좌표정보(X)']
+        weight = weight_map.get(row['혼잡도'], 0)
+        heat_data.append([lat, lon, weight])
+    
+    HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
+    # ========== 히트맵 끝 ==========
+    
+    # 사용자 위치 마커
+    if user_lat and user_lon:
         folium.Marker(
-            location=[row['좌표정보(Y)'], row['좌표정보(X)']],
-            popup=popup_html,
-            icon=folium.Icon(color=color, icon="plus", prefix="fa"),
-            tooltip=row['사업장명']
+            location=[user_lat, user_lon],
+            popup="현재 위치",
+            icon=folium.Icon(color="red", icon="home", prefix="fa")
         ).add_to(m)
     
     folium.LayerControl().add_to(m)
@@ -266,4 +240,4 @@ with col2:
         st.info("👈 왼쪽 사이드바에서 정보를 입력하고 예측 버튼을 눌러주세요.")
 
 st.markdown("---")
-st.caption("※ 마커 색상: 빨강(가용병상 ≤5), 주황(6~15), 초록(≥16). WMS 레이어는 국립중앙의료원 제공.")
+st.caption("🔥 히트맵: 빨간색일수록 혼잡, 초록색일수록 여유. WMS 레이어는 국립중앙의료원 제공.")
