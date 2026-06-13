@@ -12,6 +12,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from datetime import datetime
 from folium.plugins import HeatMap
+import utm
 
 # ---------- 한글 폰트 ----------
 try:
@@ -79,17 +80,44 @@ def load_model():
         st.warning(f"모델 로드 실패: {e}")
         return None, None, None, None
 
-# ---------- 데이터 로드 (이미 지오코딩된 CSV) ----------
+# ---------- 데이터 로드 (원본 CSV + UTM 변환) ----------
 @st.cache_data
 def load_hospital_data():
-    df = pd.read_csv("hospitals_geocoded.csv")   # <-- pre-geocoded file
-    # 필요한 컬럼 확인
-    required = ['사업장명', '위도', '경도', '병상수', '입원실수', '의료인수', 'cluster', '혼잡도']
+    df = pd.read_csv("emergency_hospitals.csv")
+    
+    # 필수 컬럼 확인
+    required = ['사업장명', '도로명주소', '병상수', '입원실수', '의료인수', 'cluster', '혼잡도', '좌표정보(X)', '좌표정보(Y)']
     for col in required:
         if col not in df.columns:
-            st.error(f"CSV에 '{col}' 컬럼이 없습니다. 올바른 hospitals_geocoded.csv를 사용하세요.")
+            st.error(f"CSV에 '{col}' 컬럼이 없습니다.")
             st.stop()
-    # 전문과목 기본값
+    
+    # 좌표값 숫자 변환
+    df['좌표정보(X)'] = pd.to_numeric(df['좌표정보(X)'], errors='coerce')
+    df['좌표정보(Y)'] = pd.to_numeric(df['좌표정보(Y)'], errors='coerce')
+    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    
+    # UTM → 위경도 변환 (Zone 52N, 대한민국)
+    lats, lons = [], []
+    for _, row in df.iterrows():
+        try:
+            lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
+            # 유효한 좌표 범위 확인 (대한민국)
+            if 33 <= lat <= 39 and 124 <= lon <= 132:
+                lats.append(lat)
+                lons.append(lon)
+            else:
+                lats.append(None)
+                lons.append(None)
+        except:
+            lats.append(None)
+            lons.append(None)
+    
+    df['위도'] = lats
+    df['경도'] = lons
+    df = df.dropna(subset=['위도', '경도'])
+    
+    # 전문과목 컬럼이 없으면 기본값 생성
     if 'specialties' not in df.columns:
         if '의료기관종별명' in df.columns:
             df['specialties'] = df['의료기관종별명'].apply(
@@ -97,10 +125,12 @@ def load_hospital_data():
             )
         else:
             df['specialties'] = "외상,심장,신경,정형,소아"
+    
     # 마커 색상
     color_map = {'혼잡': 'red', '보통': 'orange', '여유': 'green'}
     df['marker_color'] = df['혼잡도'].map(color_map).fillna('gray')
     df['congestion_text'] = df['혼잡도']
+    
     return df
 
 @st.cache_data(ttl=300)
