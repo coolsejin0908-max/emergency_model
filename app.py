@@ -12,7 +12,9 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from datetime import datetime
 from folium.plugins import HeatMap
-import utm
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+import time
 
 # ---------- 한글 폰트 설정 ----------
 try:
@@ -49,6 +51,9 @@ except:
 
 # ---------- 거리 계산 함수 ----------
 def haversine_distance(lat1, lon1, lat2, lon2):
+    """두 위경도 간 거리(km) 반환, 좌표 None 처리"""
+    if None in [lat1, lon1, lat2, lon2]:
+        return np.inf
     R = 6371
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -79,41 +84,89 @@ def load_model():
         le_type = joblib.load("le_medical_type.pkl")
         le_scale = joblib.load("le_bed_scale.pkl")
         return rf, scaler, le_type, le_scale
-    except Exception:
+    except Exception as e:
+        st.error(f"모델 로드 실패: {e}")
         return None, None, None, None
 
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
-    if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
-        st.error("CSV에 좌표 컬럼이 없습니다.")
-        st.stop()
     
-    # 좌표값이 숫자로 변환 가능한지 확인
+    # 필수 컬럼 존재 확인
+    required_cols = ['사업장명', '도로명주소', '병상수', '입원실수', '의료인수', 
+                     'cluster', '혼잡도', '좌표정보(X)', '좌표정보(Y)']
+    for col in required_cols:
+        if col not in df.columns:
+            st.error(f"CSV에 필요한 컬럼 '{col}'이 없습니다.")
+            st.stop()
+    
+    # 좌표값 숫자 변환
     df['좌표정보(X)'] = pd.to_numeric(df['좌표정보(X)'], errors='coerce')
     df['좌표정보(Y)'] = pd.to_numeric(df['좌표정보(Y)'], errors='coerce')
+    
+    # 유효한 좌표 범위 (대한민국 위경도)
+    def is_valid_korea_coord(lat, lon):
+        return (33 <= lat <= 39) and (124 <= lon <= 132)
+    
+    # 기존 좌표 중 유효한 것만 남김
+    df['is_valid'] = df.apply(
+        lambda row: is_valid_korea_coord(row['좌표정보(Y)'], row['좌표정보(X)']), 
+        axis=1
+    )
+    valid_mask = df['is_valid']
+    
+    # 세션 상태에 지오코딩 결과 캐싱 (도로명주소 -> 위경도)
+    if 'geocode_cache' not in st.session_state:
+        st.session_state.geocode_cache = {}
+    
+    # 지오코딩 함수 (세션 상태 캐시 사용)
+    def geocode_address(addr):
+        if addr in st.session_state.geocode_cache:
+            return st.session_state.geocode_cache[addr]
+        try:
+            geolocator = Nominatim(user_agent="hospital_map_app")
+            geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+            location = geocode(addr, language='ko')
+            if location:
+                lat, lon = location.latitude, location.longitude
+                st.session_state.geocode_cache[addr] = (lat, lon)
+                return lat, lon
+        except Exception as e:
+            st.warning(f"지오코딩 실패 ({addr}): {e}")
+        return None, None
+    
+    # 유효하지 않은 좌표는 주소로 지오코딩
+    for idx in df[~valid_mask].index:
+        addr = df.loc[idx, '도로명주소']
+        if pd.notna(addr):
+            lat, lon = geocode_address(addr)
+            if lat is not None and lon is not None:
+                df.loc[idx, '좌표정보(Y)'] = lat
+                df.loc[idx, '좌표정보(X)'] = lon
+                valid_mask[idx] = True
+            else:
+                # 지오코딩 실패 시 원본 좌표 그대로 (나중에 필터링)
+                pass
+    
+    # 최종 유효 좌표만 남김
+    df = df[valid_mask].copy()
     df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
     
-    # UTM 변환 시도 (값이 100000 이상이면 UTM으로 간주)
-    sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
-    if sample_x > 100000:
-        st.info("🗺️ UTM 좌표를 위도/경도로 변환 중...")
-        def convert(row):
-            try:
-                lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
-                return lat, lon
-            except Exception as e:
-                return None, None
-        df['위도'], df['경도'] = zip(*df.apply(convert, axis=1))
-        if df['위도'].notna().sum() > 0:
-            df['좌표정보(Y)'] = df['위도']
-            df['좌표정보(X)'] = df['경도']
-            df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
-            st.success(f"변환 완료! 유효한 좌표 수: {len(df)}")
-        else:
-            st.warning("UTM 변환 실패, 원본 좌표를 그대로 사용합니다.")
+    # 혼잡도 컬럼이 문자열인지 확인
+    if '혼잡도' in df.columns:
+        df['congestion_text'] = df['혼잡도']
     else:
-        st.info("이미 위도/경도 좌표로 간주합니다.")
+        df['congestion_text'] = '보통'
+    
+    # 전문과목 컬럼이 없으면 임시 데이터 생성 (예시)
+    if 'specialties' not in df.columns:
+        # 간단한 매핑: 종합병원은 모든 과목 보유, 병원은 제한적
+        def infer_specialties(row):
+            if row['의료기관종별명'] == '종합병원':
+                return "외상,심장,신경,정형,소아"
+            else:
+                return "외상,정형"  # 기본값
+        df['specialties'] = df.apply(infer_specialties, axis=1)
     
     return df
 
@@ -236,9 +289,11 @@ col1.markdown(f"""
 <div class="metric-card"><div class="metric-value">{total_hosp}</div><div class="metric-label">전체 응급실</div></div>
 """, unsafe_allow_html=True)
 
-df_near = df_hosp.copy()
-df_near['distance'] = df_near.apply(lambda row: haversine_distance(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), axis=1)
-near_count = len(df_near[df_near['distance'] <= radius_km])
+df_hosp['distance'] = df_hosp.apply(
+    lambda row: haversine_distance(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), 
+    axis=1
+)
+near_count = len(df_hosp[df_hosp['distance'] <= radius_km])
 col2.markdown(f"""
 <div class="metric-card"><div class="metric-value">{near_count}</div><div class="metric-label">반경 {radius_km}km 내 응급실</div></div>
 """, unsafe_allow_html=True)
@@ -268,13 +323,12 @@ with col_map:
     st.subheader("🗺️ 응급실 혼잡도 및 추천 지도")
     
     # 반경 내 병원 필터링
-    near_hosp = df_near[df_near['distance'] <= radius_km].copy()
+    near_hosp = df_hosp[df_hosp['distance'] <= radius_km].copy()
     
     # 디버깅 정보 (앱 실행 시 확인)
     with st.expander("🔍 디버깅 정보 (관리자용)"):
         st.write(f"df_hosp 전체 행 수: {len(df_hosp)}")
-        st.write(f"거리 계산 후 행 수: {len(df_near)}")
-        st.write(f"반경 {radius_km}km 내 병원 수: {len(near_hosp)}")
+        st.write(f"거리 계산 후 행 수: {len(near_hosp)}")
         if not near_hosp.empty:
             st.write("좌표 샘플 (첫 3개):")
             st.write(near_hosp[['사업장명', '좌표정보(Y)', '좌표정보(X)']].head(3))
@@ -286,30 +340,34 @@ with col_map:
     else:
         # 지도 생성
         m = folium.Map(location=[user_lat, user_lon], zoom_start=12)
-        folium.WmsTileLayer(
-            url="https://safemap.go.kr/openapi2/IF_0047_WMS",
-            name="응급의료시설 (WMS)",
-            fmt="image/png", layers="0", transparent=True, overlay=True, control=True
-        ).add_to(m)
         
-        # 히트맵
-        if '혼잡도' in near_hosp.columns:
-            heat_data = []
-            weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
-            for _, row in near_hosp.iterrows():
-                heat_data.append([row['좌표정보(Y)'], row['좌표정보(X)'], weight_map.get(row['혼잡도'], 0)])
-            if heat_data:
-                HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
+        # WMS 레이어 추가 (오류 무시)
+        try:
+            folium.WmsTileLayer(
+                url="https://safemap.go.kr/openapi2/IF_0047_WMS",
+                name="응급의료시설 (WMS)",
+                fmt="image/png", layers="0", transparent=True, overlay=True, control=True
+            ).add_to(m)
+        except:
+            pass
+        
+        # 히트맵 (혼잡도 가중치)
+        heat_data = []
+        weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
+        for _, row in near_hosp.iterrows():
+            heat_data.append([row['좌표정보(Y)'], row['좌표정보(X)'], weight_map.get(row['congestion_text'], 0)])
+        if heat_data:
+            HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
         
         # 사용자 위치 마커
-        folium.Marker(location=[user_lat, user_lon], popup="내 위치", icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
+        folium.Marker(
+            location=[user_lat, user_lon], 
+            popup="내 위치", 
+            icon=folium.Icon(color="red", icon="home", prefix="fa")
+        ).add_to(m)
         
         # 추천 점수 계산
         required_specialty = injury_specialty_map[injury_type]
-        if 'specialties' not in near_hosp.columns:
-            near_hosp['specialties'] = "외상,심장,신경,정형"
-        if 'congestion_text' not in near_hosp.columns:
-            near_hosp['congestion_text'] = near_hosp.get('혼잡도', "보통")
         
         def score_hospital(row):
             try:
@@ -321,9 +379,8 @@ with col_map:
             except:
                 return 0.0
         
-        scores = near_hosp.apply(score_hospital, axis=1)
         near_hosp = near_hosp.copy()
-        near_hosp['recommend_score'] = scores
+        near_hosp['recommend_score'] = near_hosp.apply(score_hospital, axis=1)
         near_hosp = near_hosp.sort_values("recommend_score", ascending=False)
         
         # 병원 마커 추가
@@ -336,7 +393,8 @@ with col_map:
                 icon=folium.Icon(color=color, icon="plus", prefix="fa")
             ).add_to(m)
         
-        st_folium(m, width=900, height=500)
+        # 지도 출력
+        st_folium(m, width=900, height=500, key="hospital_map")
 
 with col_result:
     st.subheader("📋 맞춤형 추천 결과")
