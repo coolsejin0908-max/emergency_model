@@ -13,8 +13,8 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from folium.plugins import HeatMap
 import utm
-from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
+import time
+import json
 
 # ---------- 한글 폰트 설정 ----------
 try:
@@ -43,7 +43,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# ---------- Secrets API 키 ----------
+# ---------- Secrets API 키 (실시간 병상용) ----------
 try:
     SERVICE_KEY = st.secrets["API_KEY"]
 except:
@@ -74,24 +74,45 @@ injury_specialty_map = {
 }
 injury_options = list(injury_specialty_map.keys())
 
-# ---------- 지오코딩 캐시 (세션 상태) ----------
-if 'geocode_cache' not in st.session_state:
-    st.session_state.geocode_cache = {}
+# ---------- 지오코딩 함수 (requests 직접 사용, geopy 없음) ----------
+@st.cache_resource
+def get_geocoder():
+    # 세션에 지오코딩 결과를 저장할 딕셔너리
+    if "geocode_cache" not in st.session_state:
+        st.session_state.geocode_cache = {}
+    return st.session_state.geocode_cache
 
 def geocode_address(addr):
-    """주소 → (위도, 경도), 캐싱 적용"""
-    if addr in st.session_state.geocode_cache:
-        return st.session_state.geocode_cache[addr]
+    """주소 -> (위도, 경도) using Nominatim API (no geopy)"""
+    cache = get_geocoder()
+    if addr in cache:
+        return cache[addr]
+    
+    # Nominatim 요청 (user-agent 필수)
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": addr,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 0,
+        "accept-language": "ko"
+    }
+    headers = {
+        "User-Agent": "EmergencyHospitalApp/1.0 (your_email@example.com)"
+    }
     try:
-        geolocator = Nominatim(user_agent="hospital_map_app")
-        geocode = RateLimiter(geolocator.geocode, min_delay_seconds=1)
-        location = geocode(addr, language='ko')
-        if location:
-            lat, lon = location.latitude, location.longitude
-            st.session_state.geocode_cache[addr] = (lat, lon)
-            return lat, lon
+        time.sleep(1)  # rate limiting
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data:
+                lat = float(data[0]["lat"])
+                lon = float(data[0]["lon"])
+                cache[addr] = (lat, lon)
+                return lat, lon
     except Exception as e:
         st.warning(f"지오코딩 실패 ({addr}): {e}")
+    cache[addr] = (None, None)
     return None, None
 
 # ---------- 모델 및 데이터 로드 ----------
@@ -103,72 +124,67 @@ def load_model():
         le_type = joblib.load("le_medical_type.pkl")
         le_scale = joblib.load("le_bed_scale.pkl")
         return rf, scaler, le_type, le_scale
-    except Exception:
+    except Exception as e:
+        st.warning(f"모델 로드 실패: {e}")
         return None, None, None, None
 
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
     
-    # 1. 기본 컬럼 확인
+    # 기본 컬럼 확인
     required = ['사업장명', '도로명주소', '병상수', '입원실수', '의료인수', 'cluster', '혼잡도']
     for col in required:
         if col not in df.columns:
             st.error(f"CSV에 '{col}' 컬럼이 없습니다.")
             st.stop()
     
-    # 2. 좌표 컬럼이 있으면 일단 숫자로 변환
+    # 좌표 컬럼이 있으면 읽기
     has_xy = ('좌표정보(X)' in df.columns) and ('좌표정보(Y)' in df.columns)
     if has_xy:
         df['좌표정보(X)'] = pd.to_numeric(df['좌표정보(X)'], errors='coerce')
         df['좌표정보(Y)'] = pd.to_numeric(df['좌표정보(Y)'], errors='coerce')
-    else:
-        df['좌표정보(X)'] = np.nan
-        df['좌표정보(Y)'] = np.nan
     
-    # 3. 유효한 위도/경도인지 검사 (대한민국 범위)
-    def is_valid_latlon(lat, lon):
-        return (33 <= lat <= 39) and (124 <= lon <= 132)
-    
-    # 4. 좌표가 없거나 범위 밖이면 도로명주소로 지오코딩
+    # 위도/경도 초기화
     lat_list = []
     lon_list = []
+    
     for idx, row in df.iterrows():
-        lat = row['좌표정보(Y)'] if has_xy else None
-        lon = row['좌표정보(X)'] if has_xy else None
-        if pd.notna(lat) and pd.notna(lon) and is_valid_latlon(lat, lon):
-            lat_list.append(lat)
-            lon_list.append(lon)
-        else:
-            # UTM 변환 시도 (값이 100000 이상이면 UTM으로 간주)
-            if has_xy and pd.notna(row['좌표정보(X)']) and row['좌표정보(X)'] > 100000:
+        lat, lon = None, None
+        
+        # 1. 기존 좌표가 유효한지 확인 (대한민국 범위)
+        if has_xy and pd.notna(row['좌표정보(X)']) and pd.notna(row['좌표정보(Y)']):
+            x_val = row['좌표정보(X)']
+            y_val = row['좌표정보(Y)']
+            # UTM like? (값이 100000 이상)
+            if x_val > 100000:
                 try:
-                    lat_utm, lon_utm = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
-                    if is_valid_latlon(lat_utm, lon_utm):
-                        lat_list.append(lat_utm)
-                        lon_list.append(lon_utm)
+                    lat, lon = utm.to_latlon(x_val, y_val, 52, 'N')
+                    if 33 <= lat <= 39 and 124 <= lon <= 132:
+                        lat_list.append(lat)
+                        lon_list.append(lon)
                         continue
                 except:
                     pass
-            # 마지막 수단: 주소 지오코딩
-            addr = row['도로명주소']
-            if pd.notna(addr):
-                lat_g, lon_g = geocode_address(addr)
-                if lat_g and lon_g:
-                    lat_list.append(lat_g)
-                    lon_list.append(lon_g)
-                else:
-                    lat_list.append(None)
-                    lon_list.append(None)
-            else:
-                lat_list.append(None)
-                lon_list.append(None)
+            # 일반적인 위경도 범위 확인
+            if 33 <= y_val <= 39 and 124 <= x_val <= 132:
+                lat_list.append(y_val)
+                lon_list.append(x_val)
+                continue
+        
+        # 2. 도로명주소로 지오코딩
+        addr = row['도로명주소']
+        if pd.notna(addr):
+            lat, lon = geocode_address(addr)
+        
+        lat_list.append(lat)
+        lon_list.append(lon)
     
     df['위도'] = lat_list
     df['경도'] = lon_list
     df = df.dropna(subset=['위도', '경도'])
     
-    # 5. 전문과목 컬럼이 없으면 생성
+    # 전문과목 컬럼 없으면 생성
     if 'specialties' not in df.columns:
         if '의료기관종별명' in df.columns:
             df['specialties'] = df['의료기관종별명'].apply(
@@ -177,7 +193,7 @@ def load_hospital_data():
         else:
             df['specialties'] = "외상,심장,신경,정형,소아"
     
-    # 6. 혼잡도 텍스트 정리
+    # 혼잡도 텍스트 및 마커 색상
     df['congestion_text'] = df['혼잡도']
     color_map = {'혼잡': 'red', '보통': 'orange', '여유': 'green'}
     df['marker_color'] = df['congestion_text'].map(color_map).fillna('gray')
