@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import joblib
@@ -6,24 +7,17 @@ from streamlit_folium import st_folium
 from streamlit_geolocation import streamlit_geolocation
 import requests
 import xml.etree.ElementTree as ET
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 from math import radians, sin, cos, sqrt, atan2
-from folium.plugins import HeatMap
-import utm
 from datetime import datetime
+import utm
 
 # ---------- 한글 폰트 설정 ----------
-try:
-    mpl.font_manager.fontManager.addfont('/usr/share/fonts/truetype/nanum/NanumGothic.ttf')
-    plt.rc('font', family='NanumGothic')
-except:
-    pass
 plt.rcParams['axes.unicode_minus'] = False
 
 st.set_page_config(page_title="응급실 혼잡도 예측 대시보드", layout="wide")
 
-# ---------- CSS 스타일 (지진 대시보드 스타일과 비슷하게) ----------
+# ---------- CSS 스타일 ----------
 st.markdown("""
     <style>
     .big-font { font-size: 28px !important; font-weight: bold; color: #1f77b4; }
@@ -60,9 +54,6 @@ def load_model():
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
-    if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
-        st.error("CSV에 좌표 컬럼이 없습니다.")
-        st.stop()
     # UTM → WGS84 변환 (값이 100000 이상이면 UTM)
     sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
     if sample_x > 100000:
@@ -75,10 +66,14 @@ def load_hospital_data():
                 return None, None
         df['위도'], df['경도'] = zip(*df.apply(convert_utm_row, axis=1))
         df = df.dropna(subset=['위도', '경도'])
+        # 기존 좌표 컬럼 갱신 (folium에서 사용)
         df['좌표정보(Y)'] = df['위도']
         df['좌표정보(X)'] = df['경도']
         df = df.drop(columns=['위도', '경도'])
     df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    # 혼잡도 컬럼이 없으면 기본값 부여
+    if '혼잡도' not in df.columns:
+        df['혼잡도'] = '보통'
     return df
 
 # 실시간 가용 병상 조회
@@ -123,8 +118,8 @@ def haversine(lat1, lon1, lat2, lon2):
 
 # 혼잡도 예측
 def predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type, le_scale):
-    occupancy = room / bed
-    doctor_per_room = room / doctor
+    occupancy = room / bed if bed > 0 else 0
+    doctor_per_room = doctor / room if room > 0 else 0
     is_general = 1 if med_type == "종합병원" else 0
     if bed <= 100:
         bed_scale = "소형"
@@ -135,7 +130,7 @@ def predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type
     med_enc = le_type.transform([med_type])[0]
     scale_enc = le_scale.transform([bed_scale])[0]
     features = [
-        bed, room, doctor, cluster, doctor / bed,
+        bed, room, doctor, cluster, doctor / bed if bed > 0 else 0,
         occupancy, doctor_per_room, is_general, scale_enc
     ]
     cols = [
@@ -152,7 +147,7 @@ def predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type
 # ---------- 메인 ----------
 rf, scaler, le_type, le_scale = load_model()
 df_hosp = load_hospital_data()
-realtime_beds = get_realtime_beds()  # 미리 로드
+realtime_beds = get_realtime_beds()
 
 # ---------- 사이드바: 입력 영역 ----------
 st.sidebar.title("🏥 응급실 혼잡도 예측")
@@ -205,10 +200,8 @@ st.title("🏥 응급실 혼잡도 예측 대시보드")
 st.markdown('<div class="big-font">실시간 응급실 혼잡도 분석</div>', unsafe_allow_html=True)
 st.markdown("---")
 
-# 상단 메트릭 (KPI)
+# 상단 메트릭
 col1, col2, col3, col4 = st.columns(4)
-
-# 전체 병원 수
 total_hosp = len(df_hosp)
 col1.markdown(f"""
 <div class="metric-card">
@@ -217,7 +210,6 @@ col1.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 반경 내 병원 수
 df_near = df_hosp.copy()
 df_near['distance'] = df_near.apply(
     lambda row: haversine(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), axis=1)
@@ -229,7 +221,7 @@ col2.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 평균 혼잡도 (예: 혼잡 비율)
+# 평균 혼잡도
 if '혼잡도' in df_hosp.columns:
     congestion_rate = (df_hosp['혼잡도'] == '혼잡').mean() * 100
     col3.markdown(f"""
@@ -246,7 +238,6 @@ else:
     </div>
     """, unsafe_allow_html=True)
 
-# 실시간 가용 병상 (API 연동)
 if realtime_beds:
     avg_available = sum(realtime_beds.values()) / len(realtime_beds) if realtime_beds else 0
     col4.markdown(f"""
@@ -265,40 +256,56 @@ else:
 
 st.markdown("---")
 
-# 지도와 예측 결과를 나란히 배치
+# 지도와 예측 결과 나란히
 col_map, col_result = st.columns([3, 1])
 
 with col_map:
     st.subheader("🗺️ 응급의료시설 혼잡도 지도")
     map_center = [user_lat, user_lon]
     m = folium.Map(location=map_center, zoom_start=12)
-    # WMS 레이어
-    folium.WmsTileLayer(
-        url="https://safemap.go.kr/openapi2/IF_0047_WMS",
-        name="응급의료시설 (WMS)",
-        fmt="image/png",
-        layers="0",
-        transparent=True,
-        overlay=True,
-        control=True
-    ).add_to(m)
-    # 히트맵
+
+    # 반경 내 병원에 대해 색상 마커 추가
     near_hosp = df_near[df_near['distance'] <= radius_km].copy()
-    if not near_hosp.empty and '혼잡도' in near_hosp.columns:
-        heat_data = []
-        weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
+    if not near_hosp.empty:
         for _, row in near_hosp.iterrows():
             lat = row['좌표정보(Y)']
             lon = row['좌표정보(X)']
-            weight = weight_map.get(row['혼잡도'], 0)
-            heat_data.append([lat, lon, weight])
-        HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
-    # 사용자 마커
+            congestion = row.get('혼잡도', '보통')
+            # 색상 결정
+            if congestion == '여유':
+                color = 'green'
+            elif congestion == '보통':
+                color = 'orange'
+            elif congestion == '혼잡':
+                color = 'red'
+            else:
+                color = 'gray'
+            popup_text = f"<b>{row['사업장명']}</b><br>혼잡도: {congestion}<br>병상수: {row.get('병상수', '-')}<br>의료인수: {row.get('의료인수', '-')}"
+            folium.Marker(
+                location=[lat, lon],
+                popup=popup_text,
+                tooltip=f"{row['사업장명']} ({congestion})",
+                icon=folium.Icon(color=color, icon='hospital', prefix='fa')
+            ).add_to(m)
+
+    # 범례 추가
+    legend_html = '''
+    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 1000; background-color: white; padding: 10px; border: 2px solid grey; border-radius: 5px;">
+        <b>🚨 응급실 혼잡도</b><br>
+        <i class="fa fa-circle" style="color: red;"></i> 혼잡<br>
+        <i class="fa fa-circle" style="color: orange;"></i> 보통<br>
+        <i class="fa fa-circle" style="color: green;"></i> 여유
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # 사용자 위치 마커
     folium.Marker(
         location=[user_lat, user_lon],
         popup="내 위치",
         icon=folium.Icon(color="red", icon="home", prefix="fa")
     ).add_to(m)
+
     st_folium(m, width=900, height=500)
 
 with col_result:
@@ -306,7 +313,6 @@ with col_result:
     if predict_btn:
         with st.spinner("예측 중..."):
             pred, prob = predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type, le_scale)
-        # 위험도 스타일 (지진 대시보드처럼)
         if pred == "혼잡":
             st.error("### 🔴 매우 높음")
             st.markdown(f"#### 예측 혼잡도: **{pred}**")
@@ -327,10 +333,11 @@ with col_result:
 st.markdown("---")
 st.subheader("📋 주변 응급실 목록 (반경 내)")
 if not near_hosp.empty:
-    # 표시할 컬럼 선택
-    show_cols = ['사업장명', '병상수', '의료인수', '혼잡도'] if '혼잡도' in near_hosp.columns else ['사업장명', '병상수', '의료인수']
-    st.dataframe(near_hosp[show_cols].head(20), use_container_width=True)
+    show_cols = ['사업장명', '병상수', '의료인수', '혼잡도', 'distance']
+    # 컬럼 존재 여부 확인
+    cols_exists = [c for c in show_cols if c in near_hosp.columns]
+    st.dataframe(near_hosp[cols_exists].head(20), use_container_width=True)
 else:
     st.info("주변에 응급실이 없습니다.")
 
-st.caption("※ 히트맵: 빨강=혼잡, 초록=여유. 마커 색상은 가용 병상 수 기준. WMS 레이어는 국립중앙의료원 제공.")
+st.caption("※ 마커 색상: 빨강=혼잡, 주황=보통, 초록=여유. 지도는 반경 내 응급실만 표시합니다.")
