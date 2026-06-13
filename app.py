@@ -79,7 +79,7 @@ def load_model():
         le_type = joblib.load("le_medical_type.pkl")
         le_scale = joblib.load("le_bed_scale.pkl")
         return rf, scaler, le_type, le_scale
-    except:
+    except Exception:
         return None, None, None, None
 
 @st.cache_data
@@ -88,14 +88,14 @@ def load_hospital_data():
     if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
         st.error("CSV에 좌표 컬럼이 없습니다.")
         st.stop()
-    # UTM 변환 (필요시)
+    # UTM -> WGS84 변환 (필요시)
     sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
     if sample_x > 100000:
         def convert(row):
             try:
                 lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
                 return lat, lon
-            except:
+            except Exception:
                 return None, None
         df['위도'], df['경도'] = zip(*df.apply(convert, axis=1))
         df = df.dropna(subset=['위도', '경도'])
@@ -129,7 +129,7 @@ def get_realtime_beds(stage1="서울특별시", stage2=""):
                     if hpid and hvec and hvec.isdigit():
                         bed_dict[hpid] = int(hvec)
                 return bed_dict
-    except:
+    except Exception:
         pass
     return {}
 
@@ -161,7 +161,7 @@ def predict_congestion(bed, room, doctor, cluster, med_type, rf, scaler, le_type
     prob = rf.predict_proba(input_scaled)[0]
     return pred, dict(zip(rf.classes_, prob))
 
-# ---------- 메인 ----------
+# ---------- 메인 실행 ----------
 rf, scaler, le_type, le_scale = load_model()
 df_hosp = load_hospital_data()
 realtime_beds = get_realtime_beds()
@@ -170,10 +170,9 @@ st.title("🏥 응급실 혼잡도 예측 및 부상 기반 병원 추천")
 st.markdown('<div class="big-font">실시간 응급실 분석 & 맞춤형 추천</div>', unsafe_allow_html=True)
 st.markdown("---")
 
-# ---------- 사이드바: 사용자 위치 및 추천 조건 ----------
+# ---------- 사이드바: 위치 및 추천 조건 ----------
 st.sidebar.header("📍 내 위치 설정")
 location = streamlit_geolocation()
-# ----- 안전한 위치 처리 -----
 if location and location.get('latitude') is not None and location.get('longitude') is not None:
     user_lat = location['latitude']
     user_lon = location['longitude']
@@ -218,7 +217,7 @@ else:
     med_type = st.sidebar.radio("의료기관 종별", ["종합병원", "병원"])
 predict_btn = st.sidebar.button("🚀 혼잡도 예측", type="primary", use_container_width=True)
 
-# ---------- 메인 대시보드 (KPI) ----------
+# ---------- KPI 메트릭 ----------
 col1, col2, col3, col4 = st.columns(4)
 total_hosp = len(df_hosp)
 col1.markdown(f"""
@@ -241,7 +240,7 @@ else:
     col3.markdown("<div class='metric-card'><div class='metric-value'>-</div><div class='metric-label'>혼잡도 정보 없음</div></div>", unsafe_allow_html=True)
 
 if realtime_beds:
-    avg_available = sum(realtime_beds.values()) / len(realtime_beds) if realtime_beds else 0
+    avg_available = sum(realtime_beds.values()) / max(len(realtime_beds), 1)
     col4.markdown(f"""
     <div class="metric-card"><div class="metric-value">{avg_available:.1f}</div><div class="metric-label">평균 가용 응급실 병상</div></div>
     """, unsafe_allow_html=True)
@@ -269,33 +268,39 @@ with col_map:
         weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
         for _, row in near_hosp.iterrows():
             heat_data.append([row['좌표정보(Y)'], row['좌표정보(X)'], weight_map.get(row['혼잡도'], 0)])
-        HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
+        if heat_data:
+            HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
     
     # 사용자 마커
     folium.Marker(location=[user_lat, user_lon], popup="내 위치", icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
     
-    # 부상 기반 추천 점수 계산
+    # 추천 점수 계산용 필드 준비
     required_specialty = injury_specialty_map[injury_type]
-    # 전문과목 컬럼이 없으면 기본값 추가 (실제 CSV에 따라 수정 필요)
+    near_hosp = near_hosp.copy()
     if 'specialties' not in near_hosp.columns:
-        near_hosp['specialties'] = "외상,심장,신경,정형"  # 임시 기본값
-    if 'congestion_text' not in near_hosp.columns and '혼잡도' in near_hosp.columns:
-        near_hosp['congestion_text'] = near_hosp['혼잡도']
-    elif 'congestion_text' not in near_hosp.columns:
-        near_hosp['congestion_text'] = "보통"
+        near_hosp['specialties'] = "외상,심장,신경,정형"   # 기본값
+    if 'congestion_text' not in near_hosp.columns:
+        if '혼잡도' in near_hosp.columns:
+            near_hosp['congestion_text'] = near_hosp['혼잡도']
+        else:
+            near_hosp['congestion_text'] = "보통"
     
     def score_hospital(row):
-        specialty_list = row['specialties'].split(',')
-        specialty_match = 1 if required_specialty in specialty_list else 0
-        congestion_val = {"여유": 2, "보통": 1, "혼잡": 0}.get(row['congestion_text'], 1)
-        distance_score = 1 / (row['distance'] + 0.1)
-        return specialty_match * 10 + congestion_val * 5 + distance_score
+        try:
+            specs = str(row['specialties']).split(',')
+            spec_match = 1 if required_specialty in specs else 0
+            cong_val = {"여유": 2, "보통": 1, "혼잡": 0}.get(row['congestion_text'], 1)
+            dist_score = 1 / (row['distance'] + 0.1)
+            return spec_match * 10 + cong_val * 5 + dist_score
+        except:
+            return 0.0
     
-    near_hosp['recommend_score'] = near_hosp.apply(score_hospital, axis=1)
+    scores = near_hosp.apply(score_hospital, axis=1)
+    near_hosp['recommend_score'] = scores
     near_hosp = near_hosp.sort_values("recommend_score", ascending=False)
     
     # 마커 추가
-    for idx, row in near_hosp.iterrows():
+    for _, row in near_hosp.iterrows():
         color = {"혼잡":"red", "보통":"orange", "여유":"green"}.get(row['congestion_text'], "gray")
         popup_text = f"<b>{row['사업장명']}</b><br>거리: {row['distance']:.1f} km<br>혼잡도: {row['congestion_text']}<br>추천 점수: {row['recommend_score']:.1f}"
         folium.Marker(
