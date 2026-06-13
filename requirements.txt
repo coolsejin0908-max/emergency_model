@@ -5,7 +5,6 @@ scikit-learn
 joblib
 folium
 streamlit-folium
-streamlit-geolocation
 matplotlib
 requests
 utm
