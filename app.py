@@ -1,11 +1,25 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from geopy.distance import geodesic
+import math
 import folium
 from streamlit_folium import folium_static
 import random
 from datetime import datetime
+
+# ------------------------------
+# Haversine 거리 계산 함수 (km)
+# ------------------------------
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371  # 지구 반경 (km)
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = math.sin(delta_phi/2)**2 + \
+        math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
 
 # ------------------------------
 # 1. 페이지 설정 및 스타일
@@ -42,7 +56,6 @@ def load_hospital_data():
     })
     
     # 혼잡도: 가용 병상 비율로 결정 (실시간 변화 시뮬레이션)
-    # 가용 병상 = 전체 병상 * (0.2 ~ 0.9) 무작위 + 시간대 영향
     current_hour = datetime.now().hour
     if 9 <= current_hour <= 18:
         congestion_factor = 0.6   # 주간 평균 혼잡
@@ -84,41 +97,11 @@ injury_specialty_map = {
 injury_options = list(injury_specialty_map.keys())
 
 # ------------------------------
-# 3. 사용자 위치 획득 (수동 + 자동 fallback)
+# 3. 사용자 위치 획득 (수동 입력)
 # ------------------------------
 st.sidebar.header("📍 사용자 위치 설정")
-use_auto_location = st.sidebar.checkbox("내 위치 자동 감지 (브라우저 허용 필요)", value=False)
-
-if use_auto_location:
-    # HTML/JS로 위치 가져오기 (streamlit의 임시 방법)
-    location_html = """
-    <script>
-    navigator.geolocation.getCurrentPosition(
-        (position) => {
-            const lat = position.coords.latitude;
-            const lon = position.coords.longitude;
-            const output = document.getElementById('geo_output');
-            output.value = `${lat},${lon}`;
-            output.dispatchEvent(new Event('input'));
-        },
-        (error) => {
-            document.getElementById('geo_output').value = "37.5665,126.9780";  // 서울시청 default
-        }
-    );
-    </script>
-    <input type="text" id="geo_output" style="display:none">
-    """
-    st.components.v1.html(location_html, height=0)
-    # 실제로는 session_state에 저장하기 위해 별도 버튼 사용 권장
-    # 간단히: st.text_input으로 수동 입력 유도
-    st.sidebar.warning("자동 위치는 실패 시 수동으로 입력하세요.")
-    user_lat = st.sidebar.number_input("위도 (lat)", value=37.5665, format="%.6f")
-    user_lon = st.sidebar.number_input("경도 (lon)", value=126.9780, format="%.6f")
-else:
-    user_lat = st.sidebar.number_input("위도 (lat)", value=37.5665, format="%.6f", help="예: 37.5665")
-    user_lon = st.sidebar.number_input("경도 (lon)", value=126.9780, format="%.6f", help="예: 126.9780")
-
-# 현재 위치 표시
+user_lat = st.sidebar.number_input("위도 (lat)", value=37.5665, format="%.6f", help="예: 37.5665")
+user_lon = st.sidebar.number_input("경도 (lon)", value=126.9780, format="%.6f", help="예: 126.9780")
 st.sidebar.success(f"현재 위치: {user_lat:.4f}, {user_lon:.4f}")
 
 # ------------------------------
@@ -128,11 +111,9 @@ st.sidebar.header("🏥 추천 조건")
 injury_type = st.sidebar.selectbox("부상/증상 유형", injury_options)
 radius_km = st.sidebar.slider("검색 반경 (km)", min_value=1, max_value=20, value=10, step=1)
 
-# 병원까지의 거리 계산 및 필터링
+# 병원까지의 거리 계산 및 필터링 (haversine 함수 사용)
 def calculate_distance(row, user_lat, user_lon):
-    hosp_coord = (row["lat"], row["lon"])
-    user_coord = (user_lat, user_lon)
-    return geodesic(user_coord, hosp_coord).kilometers
+    return haversine_distance(user_lat, user_lon, row["lat"], row["lon"])
 
 hospitals_df["distance_km"] = hospitals_df.apply(
     lambda row: calculate_distance(row, user_lat, user_lon), axis=1
@@ -149,9 +130,7 @@ required_specialty = injury_specialty_map[injury_type]
 def score_hospital(row):
     specialty_list = row["specialties"].split(",")
     specialty_match = 1 if required_specialty in specialty_list else 0
-    # 혼잡도 점수: 여유(2), 보통(1), 혼잡(0)
     congestion_score = {"여유": 2, "보통": 1, "혼잡": 0}[row["congestion_text"]]
-    # 가까울수록 가산 (거리 역수)
     distance_score = 1 / (row["distance_km"] + 0.1)
     total = specialty_match * 10 + congestion_score * 5 + distance_score
     return total
@@ -225,7 +204,7 @@ else:
     st.sidebar.success("✅ 여유가 예상됩니다.")
 
 # ------------------------------
-# 8. 추가 정보 (실시간 병상 시뮬레이션 설명)
+# 8. 추가 정보
 # ------------------------------
 st.markdown("---")
 st.caption("※ 가용 병상 및 혼잡도는 현재 시간대 기반으로 시뮬레이션되었습니다. 실제 데이터는 병원별 API 연동 시 정확해집니다.")
