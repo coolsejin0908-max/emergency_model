@@ -49,6 +49,7 @@ except:
 
 # ---------- 거리 계산 함수 ----------
 def haversine_distance(lat1, lon1, lat2, lon2):
+    """두 지점 간 거리 (km)"""
     R = 6371
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
@@ -85,35 +86,48 @@ def load_model():
 @st.cache_data
 def load_hospital_data():
     df = pd.read_csv("emergency_hospitals.csv")
+    # 필수 컬럼 확인
     if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
-        st.error("CSV에 좌표 컬럼이 없습니다.")
+        st.error("CSV에 '좌표정보(X)' 또는 '좌표정보(Y)' 컬럼이 없습니다.")
         st.stop()
     
-    # 좌표값이 숫자로 변환 가능한지 확인
+    # 숫자형으로 변환, 오류는 NaN 처리
     df['좌표정보(X)'] = pd.to_numeric(df['좌표정보(X)'], errors='coerce')
     df['좌표정보(Y)'] = pd.to_numeric(df['좌표정보(Y)'], errors='coerce')
     df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
     
-    # UTM 변환 시도 (값이 100000 이상이면 UTM으로 간주)
+    # 좌표값의 크기로 UTM 여부 판단 (위도/경도는 -180~180, UTM은 100000 이상)
     sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
-    if sample_x > 100000:
-        st.info("🗺️ UTM 좌표를 위도/경도로 변환 중...")
-        def convert(row):
+    if abs(sample_x) > 180 or sample_x > 100000:
+        # UTM -> 위도/경도 변환 시도
+        st.info("🔄 UTM 좌표를 위도/경도로 변환 중...")
+        def convert_utm(row):
             try:
-                lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
-                return lat, lon
-            except Exception as e:
+                # 한국 UTM zone: 대부분 52N, 일부 지역 51N (여기서는 52N 시도 후 실패시 51N)
+                for zone in [52, 51]:
+                    try:
+                        lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], zone, 'N')
+                        if -90 <= lat <= 90 and -180 <= lon <= 180:
+                            return lat, lon
+                    except:
+                        continue
                 return None, None
-        df['위도'], df['경도'] = zip(*df.apply(convert, axis=1))
-        if df['위도'].notna().sum() > 0:
+            except:
+                return None, None
+        coords = df.apply(convert_utm, axis=1, result_type='expand')
+        coords.columns = ['위도', '경도']
+        df['위도'] = coords['위도']
+        df['경도'] = coords['경도']
+        df = df.dropna(subset=['위도', '경도'])
+        if len(df) > 0:
             df['좌표정보(Y)'] = df['위도']
             df['좌표정보(X)'] = df['경도']
-            df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
-            st.success(f"변환 완료! 유효한 좌표 수: {len(df)}")
+            df = df.drop(columns=['위도', '경도'])
+            st.success(f"✅ 변환 성공! 유효한 병원 수: {len(df)}")
         else:
-            st.warning("UTM 변환 실패, 원본 좌표를 그대로 사용합니다.")
+            st.warning("⚠️ UTM 변환 실패, 원본 좌표를 그대로 사용합니다. (좌표가 이미 위도/경도일 수 있음)")
     else:
-        st.info("이미 위도/경도 좌표로 간주합니다.")
+        st.info("📌 좌표가 위도/경도 범위 내에 있습니다. 변환 없이 사용합니다.")
     
     return df
 
@@ -197,7 +211,7 @@ else:
 st.sidebar.markdown("---")
 st.sidebar.header("🏥 추천 조건")
 injury_type = st.sidebar.selectbox("부상/증상 유형", injury_options)
-radius_km = st.sidebar.slider("검색 반경 (km)", 1, 50, 10)
+radius_km = st.sidebar.slider("검색 반경 (km)", 1, 100, 10)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🔬 전문가 모드 (혼잡도 예측)")
@@ -236,9 +250,15 @@ col1.markdown(f"""
 <div class="metric-card"><div class="metric-value">{total_hosp}</div><div class="metric-label">전체 응급실</div></div>
 """, unsafe_allow_html=True)
 
+# 거리 계산 및 반경 필터링 (유효 좌표 확인)
 df_near = df_hosp.copy()
-df_near['distance'] = df_near.apply(lambda row: haversine_distance(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), axis=1)
-near_count = len(df_near[df_near['distance'] <= radius_km])
+if not df_near.empty:
+    df_near['distance'] = df_near.apply(lambda row: haversine_distance(user_lat, user_lon, row['좌표정보(Y)'], row['좌표정보(X)']), axis=1)
+    near_hosp = df_near[df_near['distance'] <= radius_km].copy()
+else:
+    near_hosp = pd.DataFrame()
+
+near_count = len(near_hosp)
 col2.markdown(f"""
 <div class="metric-card"><div class="metric-value">{near_count}</div><div class="metric-label">반경 {radius_km}km 내 응급실</div></div>
 """, unsafe_allow_html=True)
@@ -267,22 +287,21 @@ col_map, col_result = st.columns([3, 1])
 with col_map:
     st.subheader("🗺️ 응급실 혼잡도 및 추천 지도")
     
-    # 반경 내 병원 필터링
-    near_hosp = df_near[df_near['distance'] <= radius_km].copy()
-    
-    # 디버깅 정보 (앱 실행 시 확인)
+    # 디버깅 정보 (접을 수 있는 창)
     with st.expander("🔍 디버깅 정보 (관리자용)"):
         st.write(f"df_hosp 전체 행 수: {len(df_hosp)}")
-        st.write(f"거리 계산 후 행 수: {len(df_near)}")
         st.write(f"반경 {radius_km}km 내 병원 수: {len(near_hosp)}")
         if not near_hosp.empty:
             st.write("좌표 샘플 (첫 3개):")
             st.write(near_hosp[['사업장명', '좌표정보(Y)', '좌표정보(X)']].head(3))
         else:
-            st.warning("반경 내 병원이 없습니다. 반경을 늘리거나 좌표를 확인하세요.")
+            st.warning("반경 내 병원이 없습니다. 다음을 확인하세요:\n"
+                       "- 좌표가 위도/경도 범위(-90~90, -180~180)인지\n"
+                       "- 사용자 위치가 한국 내에 있는지\n"
+                       "- 반경을 더 넓게 설정")
     
     if near_hosp.empty:
-        st.warning(f"반경 {radius_km}km 내에 응급실이 없습니다. 반경을 늘려보세요.")
+        st.warning(f"⚠️ 반경 {radius_km}km 내에 응급실이 없습니다. 반경을 늘리거나 위치를 조정하세요.")
     else:
         # 지도 생성
         m = folium.Map(location=[user_lat, user_lon], zoom_start=12)
@@ -306,6 +325,7 @@ with col_map:
         
         # 추천 점수 계산
         required_specialty = injury_specialty_map[injury_type]
+        # 전문과목 컬럼이 없으면 기본값 추가
         if 'specialties' not in near_hosp.columns:
             near_hosp['specialties'] = "외상,심장,신경,정형"
         if 'congestion_text' not in near_hosp.columns:
@@ -336,6 +356,7 @@ with col_map:
                 icon=folium.Icon(color=color, icon="plus", prefix="fa")
             ).add_to(m)
         
+        # 지도 렌더링 (중요: st_folium이 반드시 호출되어야 함)
         st_folium(m, width=900, height=500)
 
 with col_result:
@@ -346,8 +367,11 @@ with col_result:
         st.write(f"**거리:** {top['distance']:.1f} km")
         st.write(f"**혼잡도:** {top['congestion_text']}")
         st.write(f"**추천 점수:** {top['recommend_score']:.1f}")
+        st.write("---")
+        st.write("**추천 응급실 전체 목록은 아래에서 확인하세요.**")
     else:
         st.warning("반경 내 응급실이 없습니다.")
+    
     st.markdown("---")
     st.subheader("📋 혼잡도 예측 결과")
     if predict_btn and rf is not None:
@@ -365,7 +389,7 @@ with col_result:
             st.progress(p, text=f"{label}: {p:.1%}")
         st.markdown(f"**예측 시간**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     else:
-        st.info("👈 사이드바에서 정보를 입력하고 예측 버튼을 누르세요.")
+        st.info("👈 사이드바에서 정보를 입력하고 '혼잡도 예측' 버튼을 누르세요.")
 
 st.markdown("---")
 st.subheader("📋 주변 응급실 목록 (추천 순)")
@@ -373,5 +397,5 @@ if 'near_hosp' in locals() and not near_hosp.empty:
     show_cols = ['사업장명', 'distance', 'congestion_text', 'recommend_score']
     st.dataframe(near_hosp[show_cols].head(20).style.format({"distance": "{:.1f}", "recommend_score": "{:.1f}"}), use_container_width=True)
 else:
-    st.info("표시할 병원이 없습니다.")
+    st.info("주변 응급실이 없습니다. 반경을 늘리거나 다른 위치를 설정해보세요.")
 st.caption("※ 마커 색상: 빨강(혼잡), 주황(보통), 초록(여유). 추천 점수는 부상 전문과목 적합성 + 혼잡도 + 거리 기반.")
