@@ -88,7 +88,7 @@ def load_hospital_data():
     if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
         st.error("CSV에 좌표 컬럼이 없습니다.")
         st.stop()
-    # UTM 변환
+    # UTM 변환 (필요시)
     sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
     if sample_x > 100000:
         def convert(row):
@@ -173,12 +173,14 @@ st.markdown("---")
 # ---------- 사이드바: 사용자 위치 및 추천 조건 ----------
 st.sidebar.header("📍 내 위치 설정")
 location = streamlit_geolocation()
-if location and 'latitude' in location:
-    user_lat, user_lon = location['latitude'], location['longitude']
+# ----- 안전한 위치 처리 -----
+if location and location.get('latitude') is not None and location.get('longitude') is not None:
+    user_lat = location['latitude']
+    user_lon = location['longitude']
     st.sidebar.success(f"현재 위치: {user_lat:.4f}, {user_lon:.4f}")
 else:
-    user_lat = st.sidebar.number_input("위도", value=37.5665, format="%.6f")
-    user_lon = st.sidebar.number_input("경도", value=126.9780, format="%.6f")
+    user_lat = st.sidebar.number_input("위도 (수동 입력)", value=37.5665, format="%.6f")
+    user_lon = st.sidebar.number_input("경도 (수동 입력)", value=126.9780, format="%.6f")
     st.sidebar.info("기본 위치(서울시청) 사용 중")
 
 st.sidebar.markdown("---")
@@ -272,30 +274,30 @@ with col_map:
     # 사용자 마커
     folium.Marker(location=[user_lat, user_lon], popup="내 위치", icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
     
-    # 부상 기반 추천 점수 계산 및 마커
+    # 부상 기반 추천 점수 계산
     required_specialty = injury_specialty_map[injury_type]
-    def score_hospital(row):
-        specialty_list = row.get("specialties", "").split(",") if "specialties" in row else []
-        specialty_match = 1 if required_specialty in specialty_list else 0
-        congestion_score = {"여유": 2, "보통": 1, "혼잡": 0}.get(row.get("congestion_text", "보통"), 1)
-        distance_score = 1 / (row["distance"] + 0.1)
-        return specialty_match * 10 + congestion_score * 5 + distance_score
-    
-    # specialties, congestion_text 컬럼이 없으면 더미 생성 (혹은 기존 혼잡도 사용)
+    # 전문과목 컬럼이 없으면 기본값 추가 (실제 CSV에 따라 수정 필요)
     if 'specialties' not in near_hosp.columns:
-        near_hosp['specialties'] = "외상,심장,신경,정형"  # 기본값
+        near_hosp['specialties'] = "외상,심장,신경,정형"  # 임시 기본값
     if 'congestion_text' not in near_hosp.columns and '혼잡도' in near_hosp.columns:
         near_hosp['congestion_text'] = near_hosp['혼잡도']
     elif 'congestion_text' not in near_hosp.columns:
         near_hosp['congestion_text'] = "보통"
+    
+    def score_hospital(row):
+        specialty_list = row['specialties'].split(',')
+        specialty_match = 1 if required_specialty in specialty_list else 0
+        congestion_val = {"여유": 2, "보통": 1, "혼잡": 0}.get(row['congestion_text'], 1)
+        distance_score = 1 / (row['distance'] + 0.1)
+        return specialty_match * 10 + congestion_val * 5 + distance_score
     
     near_hosp['recommend_score'] = near_hosp.apply(score_hospital, axis=1)
     near_hosp = near_hosp.sort_values("recommend_score", ascending=False)
     
     # 마커 추가
     for idx, row in near_hosp.iterrows():
-        color = {"혼잡":"red", "보통":"orange", "여유":"green"}.get(row.get("congestion_text"), "gray")
-        popup_text = f"<b>{row['사업장명']}</b><br>거리: {row['distance']:.1f} km<br>혼잡도: {row.get('congestion_text')}<br>추천 점수: {row['recommend_score']:.1f}"
+        color = {"혼잡":"red", "보통":"orange", "여유":"green"}.get(row['congestion_text'], "gray")
+        popup_text = f"<b>{row['사업장명']}</b><br>거리: {row['distance']:.1f} km<br>혼잡도: {row['congestion_text']}<br>추천 점수: {row['recommend_score']:.1f}"
         folium.Marker(
             location=[row['좌표정보(Y)'], row['좌표정보(X)']],
             popup=folium.Popup(popup_text, max_width=300),
@@ -310,7 +312,7 @@ with col_result:
         top = near_hosp.iloc[0]
         st.success(f"### 🏥 최우선 추천: {top['사업장명']}")
         st.write(f"**거리:** {top['distance']:.1f} km")
-        st.write(f"**혼잡도:** {top.get('congestion_text', '정보 없음')}")
+        st.write(f"**혼잡도:** {top['congestion_text']}")
         st.write(f"**추천 점수:** {top['recommend_score']:.1f}")
     else:
         st.warning("반경 내 응급실이 없습니다.")
