@@ -88,21 +88,33 @@ def load_hospital_data():
     if '좌표정보(X)' not in df.columns or '좌표정보(Y)' not in df.columns:
         st.error("CSV에 좌표 컬럼이 없습니다.")
         st.stop()
-    # UTM -> WGS84 변환 (필요시)
+    
+    # 좌표값이 숫자로 변환 가능한지 확인
+    df['좌표정보(X)'] = pd.to_numeric(df['좌표정보(X)'], errors='coerce')
+    df['좌표정보(Y)'] = pd.to_numeric(df['좌표정보(Y)'], errors='coerce')
+    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+    
+    # UTM 변환 시도 (값이 100000 이상이면 UTM으로 간주)
     sample_x = df['좌표정보(X)'].iloc[0] if len(df) > 0 else 0
     if sample_x > 100000:
+        st.info("🗺️ UTM 좌표를 위도/경도로 변환 중...")
         def convert(row):
             try:
                 lat, lon = utm.to_latlon(row['좌표정보(X)'], row['좌표정보(Y)'], 52, 'N')
                 return lat, lon
-            except Exception:
+            except Exception as e:
                 return None, None
         df['위도'], df['경도'] = zip(*df.apply(convert, axis=1))
-        df = df.dropna(subset=['위도', '경도'])
-        df['좌표정보(Y)'] = df['위도']
-        df['좌표정보(X)'] = df['경도']
-        df = df.drop(columns=['위도', '경도'])
-    df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+        if df['위도'].notna().sum() > 0:
+            df['좌표정보(Y)'] = df['위도']
+            df['좌표정보(X)'] = df['경도']
+            df = df.dropna(subset=['좌표정보(X)', '좌표정보(Y)'])
+            st.success(f"변환 완료! 유효한 좌표 수: {len(df)}")
+        else:
+            st.warning("UTM 변환 실패, 원본 좌표를 그대로 사용합니다.")
+    else:
+        st.info("이미 위도/경도 좌표로 간주합니다.")
+    
     return df
 
 @st.cache_data(ttl=300)
@@ -254,66 +266,81 @@ col_map, col_result = st.columns([3, 1])
 
 with col_map:
     st.subheader("🗺️ 응급실 혼잡도 및 추천 지도")
-    m = folium.Map(location=[user_lat, user_lon], zoom_start=12)
-    folium.WmsTileLayer(
-        url="https://safemap.go.kr/openapi2/IF_0047_WMS",
-        name="응급의료시설 (WMS)",
-        fmt="image/png", layers="0", transparent=True, overlay=True, control=True
-    ).add_to(m)
     
-    # 히트맵
+    # 반경 내 병원 필터링
     near_hosp = df_near[df_near['distance'] <= radius_km].copy()
-    if not near_hosp.empty and '혼잡도' in near_hosp.columns:
-        heat_data = []
-        weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
-        for _, row in near_hosp.iterrows():
-            heat_data.append([row['좌표정보(Y)'], row['좌표정보(X)'], weight_map.get(row['혼잡도'], 0)])
-        if heat_data:
-            HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
     
-    # 사용자 마커
-    folium.Marker(location=[user_lat, user_lon], popup="내 위치", icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
-    
-    # 추천 점수 계산용 필드 준비
-    required_specialty = injury_specialty_map[injury_type]
-    near_hosp = near_hosp.copy()
-    if 'specialties' not in near_hosp.columns:
-        near_hosp['specialties'] = "외상,심장,신경,정형"   # 기본값
-    if 'congestion_text' not in near_hosp.columns:
-        if '혼잡도' in near_hosp.columns:
-            near_hosp['congestion_text'] = near_hosp['혼잡도']
+    # 디버깅 정보 (앱 실행 시 확인)
+    with st.expander("🔍 디버깅 정보 (관리자용)"):
+        st.write(f"df_hosp 전체 행 수: {len(df_hosp)}")
+        st.write(f"거리 계산 후 행 수: {len(df_near)}")
+        st.write(f"반경 {radius_km}km 내 병원 수: {len(near_hosp)}")
+        if not near_hosp.empty:
+            st.write("좌표 샘플 (첫 3개):")
+            st.write(near_hosp[['사업장명', '좌표정보(Y)', '좌표정보(X)']].head(3))
         else:
-            near_hosp['congestion_text'] = "보통"
+            st.warning("반경 내 병원이 없습니다. 반경을 늘리거나 좌표를 확인하세요.")
     
-    def score_hospital(row):
-        try:
-            specs = str(row['specialties']).split(',')
-            spec_match = 1 if required_specialty in specs else 0
-            cong_val = {"여유": 2, "보통": 1, "혼잡": 0}.get(row['congestion_text'], 1)
-            dist_score = 1 / (row['distance'] + 0.1)
-            return spec_match * 10 + cong_val * 5 + dist_score
-        except:
-            return 0.0
-    
-    scores = near_hosp.apply(score_hospital, axis=1)
-    near_hosp['recommend_score'] = scores
-    near_hosp = near_hosp.sort_values("recommend_score", ascending=False)
-    
-    # 마커 추가
-    for _, row in near_hosp.iterrows():
-        color = {"혼잡":"red", "보통":"orange", "여유":"green"}.get(row['congestion_text'], "gray")
-        popup_text = f"<b>{row['사업장명']}</b><br>거리: {row['distance']:.1f} km<br>혼잡도: {row['congestion_text']}<br>추천 점수: {row['recommend_score']:.1f}"
-        folium.Marker(
-            location=[row['좌표정보(Y)'], row['좌표정보(X)']],
-            popup=folium.Popup(popup_text, max_width=300),
-            icon=folium.Icon(color=color, icon="plus", prefix="fa")
+    if near_hosp.empty:
+        st.warning(f"반경 {radius_km}km 내에 응급실이 없습니다. 반경을 늘려보세요.")
+    else:
+        # 지도 생성
+        m = folium.Map(location=[user_lat, user_lon], zoom_start=12)
+        folium.WmsTileLayer(
+            url="https://safemap.go.kr/openapi2/IF_0047_WMS",
+            name="응급의료시설 (WMS)",
+            fmt="image/png", layers="0", transparent=True, overlay=True, control=True
         ).add_to(m)
-    
-    st_folium(m, width=900, height=500)
+        
+        # 히트맵
+        if '혼잡도' in near_hosp.columns:
+            heat_data = []
+            weight_map = {'혼잡': 1.0, '보통': 0.5, '여유': 0.1}
+            for _, row in near_hosp.iterrows():
+                heat_data.append([row['좌표정보(Y)'], row['좌표정보(X)'], weight_map.get(row['혼잡도'], 0)])
+            if heat_data:
+                HeatMap(heat_data, radius=15, blur=10, min_opacity=0.5).add_to(m)
+        
+        # 사용자 위치 마커
+        folium.Marker(location=[user_lat, user_lon], popup="내 위치", icon=folium.Icon(color="red", icon="home", prefix="fa")).add_to(m)
+        
+        # 추천 점수 계산
+        required_specialty = injury_specialty_map[injury_type]
+        if 'specialties' not in near_hosp.columns:
+            near_hosp['specialties'] = "외상,심장,신경,정형"
+        if 'congestion_text' not in near_hosp.columns:
+            near_hosp['congestion_text'] = near_hosp.get('혼잡도', "보통")
+        
+        def score_hospital(row):
+            try:
+                specs = str(row['specialties']).split(',')
+                spec_match = 1 if required_specialty in specs else 0
+                cong_val = {"여유": 2, "보통": 1, "혼잡": 0}.get(row['congestion_text'], 1)
+                dist_score = 1 / (row['distance'] + 0.1)
+                return spec_match * 10 + cong_val * 5 + dist_score
+            except:
+                return 0.0
+        
+        scores = near_hosp.apply(score_hospital, axis=1)
+        near_hosp = near_hosp.copy()
+        near_hosp['recommend_score'] = scores
+        near_hosp = near_hosp.sort_values("recommend_score", ascending=False)
+        
+        # 병원 마커 추가
+        for _, row in near_hosp.iterrows():
+            color = {"혼잡":"red", "보통":"orange", "여유":"green"}.get(row['congestion_text'], "gray")
+            popup_text = f"<b>{row['사업장명']}</b><br>거리: {row['distance']:.1f} km<br>혼잡도: {row['congestion_text']}<br>추천 점수: {row['recommend_score']:.1f}"
+            folium.Marker(
+                location=[row['좌표정보(Y)'], row['좌표정보(X)']],
+                popup=folium.Popup(popup_text, max_width=300),
+                icon=folium.Icon(color=color, icon="plus", prefix="fa")
+            ).add_to(m)
+        
+        st_folium(m, width=900, height=500)
 
 with col_result:
     st.subheader("📋 맞춤형 추천 결과")
-    if not near_hosp.empty:
+    if 'near_hosp' in locals() and not near_hosp.empty:
         top = near_hosp.iloc[0]
         st.success(f"### 🏥 최우선 추천: {top['사업장명']}")
         st.write(f"**거리:** {top['distance']:.1f} km")
@@ -342,7 +369,9 @@ with col_result:
 
 st.markdown("---")
 st.subheader("📋 주변 응급실 목록 (추천 순)")
-if not near_hosp.empty:
+if 'near_hosp' in locals() and not near_hosp.empty:
     show_cols = ['사업장명', 'distance', 'congestion_text', 'recommend_score']
     st.dataframe(near_hosp[show_cols].head(20).style.format({"distance": "{:.1f}", "recommend_score": "{:.1f}"}), use_container_width=True)
+else:
+    st.info("표시할 병원이 없습니다.")
 st.caption("※ 마커 색상: 빨강(혼잡), 주황(보통), 초록(여유). 추천 점수는 부상 전문과목 적합성 + 혼잡도 + 거리 기반.")
